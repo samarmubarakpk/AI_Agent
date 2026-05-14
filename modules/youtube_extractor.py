@@ -1,21 +1,13 @@
 """
 youtube_extractor.py
-Fetches YouTube transcripts (free) and extracts counseling insights.
-
-UPGRADES:
-- Strict JSON output
-- Token-aware chunking for long videos
-- Instagram/unsupported link detection — skip safely with log
-- Retry logic
-- Structured logging
+Fetches YouTube transcripts and extracts counseling insights using OpenAI.
 """
 
 import os
 import re
 import json
-import anthropic
+from openai import OpenAI
 from youtube_transcript_api import YouTubeTranscriptApi
-from youtube_transcript_api._errors import TranscriptsDisabled, NoTranscriptFound
 from dotenv import load_dotenv
 from modules.prompts import youtube_prompt
 from modules.video_transcriber import chunk_transcript
@@ -36,9 +28,7 @@ UNSUPPORTED_DOMAINS = [
     "twitter.com", "x.com", "snapchat.com", "pinterest.com"
 ]
 
-
 def classify_url(url: str) -> str:
-    """Return 'youtube', 'unsupported', or 'unknown'."""
     url_lower = url.lower()
     if YOUTUBE_PATTERN.search(url_lower):
         return "youtube"
@@ -47,31 +37,33 @@ def classify_url(url: str) -> str:
             return "unsupported"
     return "unknown"
 
-
 def extract_video_id(url: str) -> str | None:
     match = YOUTUBE_PATTERN.search(url)
     return match.group(1) if match else None
 
-
 # ── Transcript Fetching ───────────────────────────────────────────────────────────
 
 def get_transcript(video_id: str) -> str | None:
-    """Fetch YouTube transcript. Returns None if unavailable."""
+    """Fetch YouTube transcript. Handles both older dicts and newer objects."""
     try:
-        transcript_list = YouTubeTranscriptApi.get_transcript(
+        fetched_data = YouTubeTranscriptApi.get_transcript(
             video_id, languages=["en", "en-US", "en-GB"]
         )
-        return " ".join(chunk["text"] for chunk in transcript_list)
-    except TranscriptsDisabled:
-        logger.warning(f"Transcripts disabled for video: {video_id}")
-        return None
-    except NoTranscriptFound:
-        logger.warning(f"No English transcript for video: {video_id}")
-        return None
-    except Exception as e:
-        logger.error(f"Transcript fetch error for {video_id}: {e}")
-        return None
 
+        text_chunks = []
+        for chunk in fetched_data:
+            # If the library returns the new 'FetchedTranscriptSnippet' object
+            if hasattr(chunk, 'text'):
+                text_chunks.append(chunk.text)
+            # If the library returns the old dictionary format
+            elif isinstance(chunk, dict) and "text" in chunk:
+                text_chunks.append(chunk["text"])
+
+        return " ".join(text_chunks)
+    
+    except Exception as e:
+        logger.warning(f"Transcript fetch error for {video_id}: {e}")
+        return None
 
 # ── Insight Extraction ────────────────────────────────────────────────────────────
 
@@ -88,10 +80,8 @@ def _parse_json_response(raw: str, url: str) -> list[dict]:
         logger.warning(f"JSON parse failed for {url}: {e}")
         return []
 
-
 def extract_insights(transcript: str, url: str) -> list[dict]:
-    """Process full transcript with token-aware chunking."""
-    client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
     chunks = chunk_transcript(transcript)
     all_insights = []
 
@@ -99,36 +89,29 @@ def extract_insights(transcript: str, url: str) -> list[dict]:
         logger.info(f"  Chunk {i+1}/{len(chunks)}: {url[:60]}...")
 
         def _call(c=chunk):
-            return client.messages.create(
-                model="claude-sonnet-4-5",
-                max_tokens=1000,
-                messages=[{
-                    "role": "user",
-                    "content": youtube_prompt(url) + f"\n\nTranscript:\n{c}"
-                }]
+            return client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role": "system", "content": youtube_prompt(url)},
+                    {"role": "user", "content": f"Transcript:\n{c}"}
+                ],
+                response_format={"type": "json_object"}
             )
 
-        response = safe_api_call(_call, label=f"Claude YouTube [{url[:50]}] chunk {i+1}")
+        response = safe_api_call(_call, label=f"OpenAI YouTube [{url[:50]}] chunk {i+1}")
         if response:
-            all_insights.extend(_parse_json_response(response.content[0].text, url))
+            all_insights.extend(_parse_json_response(response.choices[0].message.content, url))
 
     return all_insights
-
 
 # ── Main Entry ────────────────────────────────────────────────────────────────────
 
 def process_youtube_url(url: str) -> list[dict]:
-    """
-    Full pipeline for a YouTube URL.
-    Safely skips unsupported platforms (Instagram, TikTok, etc.)
-    """
     url = url.strip()
     url_type = classify_url(url)
 
-    # ✅ Handle unsupported links gracefully — pipeline does NOT crash
     if url_type == "unsupported":
         log_skipped(url, "youtube", f"Unsupported platform — skipped safely")
-        logger.warning(f"Unsupported link skipped: {url}")
         return []
 
     if url_type == "unknown":

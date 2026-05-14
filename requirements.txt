@@ -2,8 +2,8 @@ google-api-python-client==2.108.0
 google-auth-httplib2==0.1.1
 google-auth-oauthlib==1.1.0
 anthropic==0.25.0
-openai==1.12.0
-youtube-transcript-api==0.6.2
+openai>=1.55.3
+youtube-transcript-api>=1.2.2
 beautifulsoup4==4.12.3
 requests==2.31.0
 python-dotenv==1.0.0

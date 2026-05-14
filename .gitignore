@@ -1,2 +1,7 @@
-/.env.example
-/AI_Agent
+.env
+credentials/
+logs/
+.venv/
+__pycache__/
+*.py[cod]
+*$py.class

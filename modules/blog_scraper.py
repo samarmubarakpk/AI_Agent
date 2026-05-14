@@ -1,19 +1,12 @@
 """
 blog_scraper.py
-Scrapes blog/article URLs and extracts counseling insights.
-
-UPGRADES:
-- Strict JSON output
-- Token-aware chunking for long articles
-- Retry logic
-- Unsupported/unreachable URL handling
-- Structured logging
+Scrapes blog/article URLs and extracts counseling insights using OpenAI.
 """
 
 import os
 import json
 import requests
-import anthropic
+from openai import OpenAI
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from modules.prompts import blog_prompt
@@ -32,23 +25,19 @@ HEADERS = {
     )
 }
 
-# URLs that are not scrapeable (social media, login-walled, etc.)
 UNSUPPORTED_DOMAINS = [
     "instagram.com", "tiktok.com", "twitter.com", "x.com",
     "facebook.com", "linkedin.com", "reddit.com",
     "youtube.com", "youtu.be"
 ]
 
-
 def is_unsupported(url: str) -> bool:
     url_lower = url.lower()
     return any(domain in url_lower for domain in UNSUPPORTED_DOMAINS)
 
-
 # ── Scraping ──────────────────────────────────────────────────────────────────────
 
 def scrape_article(url: str) -> str | None:
-    """Scrape clean text from a blog/article URL."""
     if is_unsupported(url):
         log_skipped(url, "blog", "Unsupported domain — not scrapeable")
         return None
@@ -71,11 +60,9 @@ def scrape_article(url: str) -> str | None:
 
     soup = BeautifulSoup(response.text, "html.parser")
 
-    # Remove clutter
     for tag in soup(["script", "style", "nav", "footer", "header", "aside", "iframe", "noscript"]):
         tag.decompose()
 
-    # Find main content
     main = (
         soup.find("article") or
         soup.find("main") or
@@ -96,7 +83,6 @@ def scrape_article(url: str) -> str | None:
 
     return text
 
-
 # ── Insight Extraction ────────────────────────────────────────────────────────────
 
 def _parse_json_response(raw: str, url: str) -> list[dict]:
@@ -112,10 +98,8 @@ def _parse_json_response(raw: str, url: str) -> list[dict]:
         logger.warning(f"JSON parse failed for {url}: {e}")
         return []
 
-
 def extract_insights(article_text: str, url: str) -> list[dict]:
-    """Extract insights from article text with chunking for long content."""
-    client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
     chunks = chunk_transcript(article_text, words_per_chunk=5000)
     all_insights = []
 
@@ -123,26 +107,24 @@ def extract_insights(article_text: str, url: str) -> list[dict]:
         logger.info(f"  Chunk {i+1}/{len(chunks)}: {url[:60]}")
 
         def _call(c=chunk):
-            return client.messages.create(
-                model="claude-sonnet-4-5",
-                max_tokens=1000,
-                messages=[{
-                    "role": "user",
-                    "content": blog_prompt(url) + f"\n\nArticle content:\n{c}"
-                }]
+            return client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role": "system", "content": blog_prompt(url)},
+                    {"role": "user", "content": f"Article content:\n{c}"}
+                ],
+                response_format={"type": "json_object"}
             )
 
-        response = safe_api_call(_call, label=f"Claude blog [{url[:50]}] chunk {i+1}")
+        response = safe_api_call(_call, label=f"OpenAI blog [{url[:50]}] chunk {i+1}")
         if response:
-            all_insights.extend(_parse_json_response(response.content[0].text, url))
+            all_insights.extend(_parse_json_response(response.choices[0].message.content, url))
 
     return all_insights
-
 
 # ── Main Entry ────────────────────────────────────────────────────────────────────
 
 def process_blog_url(url: str) -> list[dict]:
-    """Full pipeline: validate → scrape → chunk → extract insights."""
     url = url.strip()
 
     if is_unsupported(url):

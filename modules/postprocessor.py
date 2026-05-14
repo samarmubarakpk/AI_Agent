@@ -1,22 +1,14 @@
 """
 postprocessor.py
 Final post-processing layer before writing to Google Sheets.
-
-Steps:
-1. Normalize wording via Claude
-2. Ensure consistent professional tone
-3. Remove within-batch redundancy
-4. Validate category against fixed taxonomy
-5. Ensure all insight fields are clean strings
-
 Processes in batches to minimize API calls.
 """
 
 import os
 import json
-import anthropic
+from openai import OpenAI
 from dotenv import load_dotenv
-from modules.prompts import postprocess_prompt, VALID_CATEGORIES
+from modules.prompts import postprocess_prompt, VALID_CATEGORIES, VALID_THERAPEUTIC_USES
 from modules.retry_handler import safe_api_call
 from modules.logger import get_logger
 
@@ -25,55 +17,52 @@ logger = get_logger("postprocessor")
 
 BATCH_SIZE = 20  # Process this many insights per API call
 
-
 def validate_category(category: str) -> str:
-    """Ensure category is in the fixed taxonomy. Default to best match or 'Anxiety'."""
     if category in VALID_CATEGORIES:
         return category
-
-    # Try case-insensitive match
     for valid in VALID_CATEGORIES:
         if category.lower() == valid.lower():
             return valid
-
-    # Try partial match
     for valid in VALID_CATEGORIES:
         if valid.lower() in category.lower() or category.lower() in valid.lower():
-            logger.debug(f"Category '{category}' mapped to '{valid}'")
             return valid
-
-    logger.warning(f"Unknown category '{category}' — defaulting to 'Anxiety'")
     return "Anxiety"
 
+def validate_therapeutic_use(value: str) -> str:
+    if value in VALID_THERAPEUTIC_USES:
+        return value
+    for valid in VALID_THERAPEUTIC_USES:
+        if str(value).lower() == valid.lower():
+            return valid
+    return "Other"
+
+def clean_confidence(value) -> float:
+    try:
+        confidence = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    return round(max(0.0, min(1.0, confidence)), 2)
 
 def clean_insight_text(text: str) -> str:
-    """Basic string cleaning before AI normalization."""
-    if not text:
-        return ""
-    # Remove excessive whitespace
+    if not text: return ""
     text = " ".join(text.split())
-    # Remove leading bullets/symbols
     text = text.lstrip("•-*→►▸ ")
-    # Ensure it ends with a period
     if text and not text.endswith((".", "!", "?")):
         text += "."
     return text
 
-
 def normalize_batch(batch: list[dict]) -> list[dict]:
-    """Send a batch of insights to Claude for professional normalization."""
-    client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
-
+    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
     batch_json = json.dumps({"extracted_insights": batch}, indent=2)
 
     def _call():
-        return client.messages.create(
-            model="claude-sonnet-4-5",
-            max_tokens=2000,
+        return client.chat.completions.create(
+            model="gpt-4o-mini",
             messages=[{
                 "role": "user",
                 "content": postprocess_prompt(batch_json)
-            }]
+            }],
+            response_format={"type": "json_object"}
         )
 
     response = safe_api_call(_call, label=f"Postprocess batch of {len(batch)}")
@@ -81,48 +70,37 @@ def normalize_batch(batch: list[dict]) -> list[dict]:
         logger.warning("Postprocess API call failed — returning uncleaned batch")
         return batch
 
-    raw = response.content[0].text.strip()
-
     try:
+        raw = response.choices[0].message.content.strip()
         cleaned = raw.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
         data = json.loads(cleaned)
-        normalized = data.get("extracted_insights", batch)
-        logger.debug(f"Normalized {len(normalized)} insights in batch")
-        return normalized
+        return data.get("extracted_insights", batch)
     except json.JSONDecodeError as e:
         logger.warning(f"Postprocess JSON parse error: {e} — returning uncleaned batch")
         return batch
 
-
 def postprocess(insights: list[dict]) -> list[dict]:
-    """
-    Full post-processing pipeline:
-    1. Basic cleaning (string normalization)
-    2. Category validation
-    3. AI-based professional tone normalization (in batches)
-    """
-    if not insights:
-        return []
+    if not insights: return []
 
     logger.info(f"Post-processing {len(insights)} insights...")
 
-    # Step 1: Basic cleaning + category validation
     cleaned = []
     for item in insights:
         item["insight"] = clean_insight_text(item.get("insight", ""))
         item["category"] = validate_category(item.get("category", ""))
+        item["topic"] = " ".join(str(item.get("topic", item["category"])).split())[:80] or item["category"]
+        item["therapeutic_use"] = validate_therapeutic_use(item.get("therapeutic_use", "Other"))
+        item["evidence"] = " ".join(str(item.get("evidence", "")).split())[:300]
+        item["confidence"] = clean_confidence(item.get("confidence", 0.0))
         item["source"] = str(item.get("source", "")).strip()
         item["content_type"] = str(item.get("content_type", "")).strip().lower()
 
-        # Skip empty insights
         if not item["insight"] or len(item["insight"]) < 10:
             continue
-
         cleaned.append(item)
 
     logger.info(f"After basic cleaning: {len(cleaned)} insights")
 
-    # Step 2: AI normalization in batches
     normalized_all = []
     for i in range(0, len(cleaned), BATCH_SIZE):
         batch = cleaned[i:i + BATCH_SIZE]
